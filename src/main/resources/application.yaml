@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: parking-garage-management
+  datasource:
+    url: ${DATABASE_URL:jdbc:mysql://localhost:3306/parking_garage}
+    username: ${DATABASE_USERNAME:parking_user}
+    password: ${DATABASE_PASSWORD:parking_password}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        type:
+          java_time_use_direct_jdbc: true
+  flyway:
+    enabled: true
+
+garage:
+  simulator:
+    base-url: ${GARAGE_SIMULATOR_BASE_URL:http://localhost:3000}
+    connect-timeout: ${GARAGE_SIMULATOR_CONNECT_TIMEOUT:2s}
+    read-timeout: ${GARAGE_SIMULATOR_READ_TIMEOUT:5s}
+  synchronization:
+    enabled: ${GARAGE_SYNCHRONIZATION_ENABLED:true}

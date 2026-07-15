@@ -1,0 +1,12 @@
+garage:
+  synchronization:
+    enabled: false
+
+spring:
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        type:
+          java_time_use_direct_jdbc: true

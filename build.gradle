@@ -1,7 +1,9 @@
 plugins {
     id 'java'
+    id 'jacoco'
     id 'org.springframework.boot' version '4.1.0'
     id 'io.spring.dependency-management' version '1.1.7'
+    id 'org.sonarqube' version '7.3.1.8318'
 }
 
 group = 'com.tonyleiva'
@@ -36,4 +38,30 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    finalizedBy tasks.named('jacocoTestReport')
+}
+
+jacoco {
+    toolVersion = '0.8.15'
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+sonar {
+    properties {
+        property 'sonar.organization', 'tonyleiva'
+        property 'sonar.projectKey', 'tonyleiva_parking-garage-management'
+        property 'sonar.host.url', 'https://sonarcloud.io'
+        property 'sonar.coverage.jacoco.xmlReportPaths',
+            'build/reports/jacoco/test/jacocoTestReport.xml'
+        property 'sonar.qualitygate.wait', 'true'
+        property 'sonar.qualitygate.timeout', '300'
+    }
 }

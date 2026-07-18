@@ -1,16 +1,13 @@
 # Gerenciamento de estacionamento
 
-Backend responsável por obter do simulador a configuração e a ocupação dos setores e vagas de uma garagem, validar integralmente os dados e reconciliá-los de forma transacional no MySQL.
+Backend responsável por inicializar e gerenciar a operação de uma garagem, processando de forma transacional os eventos de entrada, estacionamento e saída enviados pelo simulador.
 
 ## Escopo atual
 
-Esta etapa implementa a fundação do projeto e a sincronização inicial da garagem.
+Esta etapa implementa a inicialização controlada da garagem e o webhook dos eventos `ENTRY`, `PARKED` e `EXIT`, incluindo idempotência, concorrência, preço dinâmico e cálculo do valor da permanência.
 
 Ainda não fazem parte deste escopo:
 
-- eventos `ENTRY`, `PARKED` e `EXIT`;
-- webhook de eventos;
-- cálculo de preço;
 - consulta de receita em `/revenue`.
 
 ## Stack
@@ -30,10 +27,10 @@ Ainda não fazem parte deste escopo:
 
 O projeto utiliza uma arquitetura em camadas inspirada em Clean Architecture e Arquitetura Hexagonal, separando regras de domínio, orquestração da aplicação, integrações de infraestrutura e apresentação HTTP, sem adicionar abstrações desnecessárias para o tamanho da solução.
 
-- `domain`: entidades e comportamento central de setores e vagas;
-- `application`: validação, sincronização e orquestração dos casos de uso;
+- `domain`: entidades e regras centrais de setores, vagas, sessões, preço e cobrança;
+- `application`: validação, inicialização e orquestração dos eventos;
 - `infrastructure`: cliente HTTP, persistência, banco de dados e configurações;
-- `presentation`: reservado para a API HTTP das próximas etapas.
+- `presentation`: controller, DTOs e tratamento global de erros da API HTTP.
 
 As entidades de domínio também são entidades JPA. Não existe uma segunda representação nem mapeadores sem benefício concreto.
 
@@ -122,15 +119,17 @@ GET http://localhost:3000/garage
 
 A URL pode ser alterada pela variável `GARAGE_SIMULATOR_BASE_URL` ou pela propriedade `garage.simulator.base-url`.
 
+O simulador precisa estar disponível quando o banco estiver vazio ou quando o reset explícito estiver habilitado. Com estado persistido e reset desabilitado, a aplicação continua pelo banco sem consultá-lo.
+
 ### 3. Iniciar a aplicação
 
-Com o MySQL e o simulador em execução:
+Com o MySQL em execução e o simulador disponível quando necessário para a carga inicial ou para o reset explícito:
 
 ```bash
 ./gradlew bootRun
 ```
 
-Durante a inicialização, a aplicação consulta o simulador, valida o snapshot e sincroniza os dados no MySQL.
+A aplicação executa na porta `3003`. Na primeira execução, consulta o simulador, valida o snapshot e realiza a carga inicial. Nas execuções seguintes, por padrão, retoma integralmente o estado do MySQL.
 
 Para habilitar logs detalhados do projeto:
 
@@ -138,7 +137,13 @@ Para habilitar logs detalhados do projeto:
 LOGGING_LEVEL_COM_TONYLEIVA_PARKINGGARAGE=DEBUG ./gradlew bootRun
 ```
 
-### 4. Conferir a sincronização
+Para apagar o cenário operacional e carregar integralmente um novo snapshot validado:
+
+```bash
+GARAGE_STARTUP_RESET_FROM_SIMULATOR=true ./gradlew bootRun
+```
+
+### 4. Conferir a inicialização
 
 É possível acessar o banco pelo DBeaver ou por outro cliente MySQL com as credenciais descritas anteriormente.
 
@@ -154,6 +159,14 @@ FROM parking_spot
 ORDER BY external_id;
 
 SELECT *
+FROM parking_session
+ORDER BY id;
+
+SELECT *
+FROM processed_webhook_event
+ORDER BY id;
+
+SELECT *
 FROM flyway_schema_history
 ORDER BY installed_rank;
 ```
@@ -164,7 +177,7 @@ Com o snapshot atual do simulador, o resultado esperado é:
 - 30 vagas;
 - horários comerciais iguais aos valores retornados pelo simulador;
 - estado de ocupação igual ao snapshot recebido;
-- migration `V1__create_garage_tables.sql` registrada no histórico do Flyway.
+- migrations V1, V2 e V3 registradas no histórico do Flyway.
 
 ## Encerrando o ambiente
 
@@ -207,35 +220,185 @@ Variáveis disponíveis:
 | `GARAGE_SIMULATOR_BASE_URL` | `http://localhost:3000` | URL base do simulador |
 | `GARAGE_SIMULATOR_CONNECT_TIMEOUT` | `2s` | Timeout de conexão |
 | `GARAGE_SIMULATOR_READ_TIMEOUT` | `5s` | Timeout de leitura |
-| `GARAGE_SYNCHRONIZATION_ENABLED` | `true` | Habilita a sincronização no startup |
+| `GARAGE_STARTUP_RESET_FROM_SIMULATOR` | `false` | Apaga o cenário atual e carrega um novo snapshot validado |
 
-Em testes ou contextos específicos, a sincronização pode ser desabilitada sem alteração de código:
+Configuração equivalente:
 
 ```yaml
 garage:
-  synchronization:
-    enabled: false
+  startup:
+    reset-from-simulator: false
 ```
 
-## Sincronização inicial
+## Estratégia de startup
 
-No funcionamento normal, `garage.synchronization.enabled` vale `true`.
+Existe uma única propriedade controlando a origem do estado inicial. A antiga propriedade `garage.synchronization.enabled` foi removida para evitar comportamentos concorrentes.
 
-Durante a inicialização, a aplicação:
+```text
+reset=true
+→ consultar e validar completamente o snapshot
+→ apagar eventos, sessões, vagas e setores
+→ carregar integralmente o novo snapshot
 
-1. consulta o endpoint `/garage`;
-2. converte o JSON externo para DTOs;
-3. valida toda a configuração em memória;
-4. cria ou atualiza setores e vagas;
-5. sobrescreve o estado de ocupação com o valor recebido;
-6. remove vagas e setores ausentes no snapshot atual;
-7. conclui toda a reconciliação em uma única transação.
+reset=false + banco vazio
+→ consultar e validar o snapshot
+→ realizar a carga inicial
 
-Nesta versão, o simulador é considerado a fonte da verdade da configuração e da ocupação. O banco é reconciliado para refletir exatamente o snapshot atual. Essa decisão foi tomada por ser a interpretação mais aderente ao enunciado.
+reset=false + banco preenchido
+→ não consultar o simulador
+→ continuar integralmente a partir do banco
+```
 
-As restrições únicas de código do setor, identificador externo da vaga e coordenadas impedem duplicações. Reiniciar a aplicação com o mesmo snapshot não cria novos registros.
+No reset, o snapshot é buscado e validado antes de qualquer exclusão. A remoção explícita e a nova carga acontecem na mesma transação, na ordem eventos processados → sessões → vagas → setores. Falhas provocam rollback integral; não são usadas cascatas destrutivas.
 
-Caso uma vaga ou setor obsoleto ainda possua referências no banco, a aplicação não força sua exclusão nem utiliza cascata destrutiva. Toda a transação sofre rollback e a inicialização é interrompida com uma mensagem clara.
+Ao final, um log `INFO` informa origem (`SIMULADOR` ou `BANCO_DE_DADOS`), setores, vagas ocupadas e livres. Em `DEBUG`, cada setor recebe um resumo com capacidade, ocupação, preço-base e horários. Vagas individuais não são registradas em `INFO`.
+
+## Endpoints expostos
+
+A aplicação expõe atualmente:
+
+| Método | Endpoint | Descrição |
+|---|---|---|
+| `POST` | `/webhook` | Recebe eventos `ENTRY`, `PARKED` e `EXIT` |
+
+O endpoint `GET /garage` pertence ao simulador externo, disponível por padrão em `http://localhost:3000/garage`.
+
+O endpoint `/revenue` ainda não foi implementado.
+
+## Webhook
+
+O simulador envia eventos para:
+
+```text
+POST http://localhost:3003/webhook
+```
+
+### ENTRY
+
+```json
+{
+  "license_plate": "ZUL0001",
+  "entry_time": "2025-01-01T12:00:00.000Z",
+  "event_type": "ENTRY"
+}
+```
+
+Cria uma sessão `ENTERED` sem setor, vaga ou preço. O horário recebido é preservado. A capacidade comprometida é `vagas ocupadas + sessões ENTERED`; sessões `PARKED` não são somadas novamente.
+
+### PARKED
+
+```json
+{
+  "license_plate": "ZUL0001",
+  "lat": -23.561684,
+  "lng": -46.655981,
+  "event_type": "PARKED"
+}
+```
+
+Localiza a vaga pelo valor numérico das coordenadas informadas, associa setor e vaga, ocupa a vaga e muda a sessão para `PARKED`. Como o contrato não fornece horário, `parkedAt` usa um `Clock` UTC injetável e tem finalidade operacional; a cobrança começa em `entryTime`.
+
+As coordenadas são armazenadas como valores decimais de escala fixa. Zeros finais não alteram seu valor numérico; por exemplo, `-46.65590100` e `-46.655901` representam a mesma coordenada.
+
+### EXIT
+
+```json
+{
+  "license_plate": "ZUL0001",
+  "exit_time": "2025-01-01T13:10:00.000Z",
+  "event_type": "EXIT"
+}
+```
+
+Libera a vaga, calcula e persiste `amount` e finaliza a sessão. `/revenue` não está implementado nesta etapa.
+
+### Exemplos com curl
+
+```bash
+curl -i -X POST http://localhost:3003/webhook \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: entry-zul0001-20250101' \
+  -d '{"license_plate":"ZUL0001","entry_time":"2025-01-01T12:00:00.000Z","event_type":"ENTRY"}'
+
+curl -i -X POST http://localhost:3003/webhook \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: parked-zul0001-20250101' \
+  -d '{"license_plate":"ZUL0001","lat":-23.561684,"lng":-46.655981,"event_type":"PARKED"}'
+
+curl -i -X POST http://localhost:3003/webhook \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: exit-zul0001-20250101' \
+  -d '{"license_plate":"ZUL0001","exit_time":"2025-01-01T13:10:00.000Z","event_type":"EXIT"}'
+```
+
+## Processamento e estados
+
+O dispatcher usa Strategy e seleciona `EntryEventHandler`, `ParkedEventHandler` ou `ExitEventHandler` pelo `event_type`. Handlers duplicados são detectados na inicialização. O ciclo permitido é:
+
+```text
+ENTERED → PARKED → FINISHED
+```
+
+Não são criadas sessões `REJECTED`. Rejeições de negócio são auditadas em `processed_webhook_event` junto com status HTTP e mensagem.
+
+## Respostas HTTP
+
+| Situação | HTTP | `status` |
+|---|---:|---|
+| Processado | 200 | `PROCESSED` |
+| Duplicado compatível | mesmo HTTP e `status` originais | `PROCESSED` ou `REJECTED`, com `duplicate: true` |
+| Payload inválido | 400 | `INVALID` |
+| Recurso inexistente | 404 | `REJECTED` |
+| Conflito de negócio | 409 | `REJECTED` |
+| Erro inesperado | 500 | `ERROR` |
+
+Uma resposta de evento também contém `duplicate`, permitindo distinguir uma repetição sem mudar o resultado original. Detalhes internos, SQL e stack traces não são expostos.
+
+## Preço dinâmico e cobrança
+
+O preço é calculado antes de ocupar a nova vaga e congelado na sessão:
+
+| Ocupação anterior | Multiplicador |
+|---|---:|
+| `0% <= ocupação < 25%` | `0.90` |
+| `25% <= ocupação < 50%` | `1.00` |
+| `50% <= ocupação < 75%` | `1.10` |
+| `75% <= ocupação < 100%` | `1.25` |
+| `100%` | setor lotado |
+
+Multiplicadores usam escala 2; preços e valores usam escala 4 e `HALF_UP`. Até 30 minutos, inclusive, o valor é zero. Depois disso, cobra-se desde a primeira hora, usando o teto da duração total: 31 minutos custam uma hora, 60 minutos custam uma hora, `60:00.001` custa duas horas e 70 minutos custam duas horas.
+
+## Idempotência
+
+O header opcional `Idempotency-Key` é respeitado exatamente como enviado, aplicando-se somente `trim` e a validação de conteúdo não vazio. O valor normalizado é a chave lógica, sem prefixo de tipo, placa ou outros dados. Seu hash SHA-256 permanece protegido por constraint única.
+
+A mesma chave fornecida pelo produtor representa uma única requisição lógica, independentemente do tipo do evento:
+
+- mesma chave e mesmo payload canônico: retorna o resultado HTTP e a mensagem originais sem reaplicar efeitos;
+- mesma chave e payload diferente: retorna `409 Conflict`;
+- mesma chave e `event_type` diferente: retorna `409 Conflict`;
+- eventos diferentes devem usar chaves diferentes.
+
+Além do hash da chave, cada evento armazena um fingerprint SHA-256 do request canônico. O fingerprint contém placa normalizada, `event_type` e somente os campos relevantes daquele evento. Uma tentativa conflitante não substitui nem altera o registro original.
+
+Sem o header, são usadas as chaves determinísticas:
+
+```text
+ENTRY|licensePlate|entryTime
+PARKED|licensePlate|sessionEntryTime|latitude|longitude
+PARKED|licensePlate|NO_ACTIVE_SESSION|latitude|longitude
+EXIT|licensePlate|exitTime
+```
+
+A placa é convertida para maiúsculas, instantes usam `Instant.toString()` e coordenadas são normalizadas sem zeros finais. No `PARKED`, uma sessão ativa inclui seu `sessionEntryTime`, evitando colisões entre permanências distintas na mesma vaga. Sem sessão ativa, o marcador semântico `NO_ACTIVE_SESSION` identifica a rejeição sem criar um horário fictício. Uma sessão futura válida gera uma chave diferente.
+
+Evento, resultado e alteração operacional são confirmados na mesma transação. A constraint única protege também contra requisições concorrentes. O header continua sendo a forma mais robusta de idempotência porque o contrato do simulador não fornece `event_id`; as chaves determinísticas são o fallback da aplicação.
+
+## Concorrência e locks
+
+São usados locks `PESSIMISTIC_WRITE` específicos. No `PARKED`, a ordem é sessão → vaga → setor. O lock do setor serializa estacionamentos simultâneos em vagas diferentes e garante que o segundo preço observe a ocupação confirmada pelo primeiro.
+
+No `ENTRY`, os setores são bloqueados por ID para serializar a capacidade global. As transações de `ENTRY` e `PARKED` usam localmente `READ_COMMITTED`, pois suas contagens precisam observar commits ocorridos enquanto aguardavam os locks; o isolamento global não é alterado. As transações permanecem curtas.
 
 ## Validação fail-fast
 
@@ -268,20 +431,25 @@ A migration inicial está em:
 src/main/resources/db/migration/V1__create_garage_tables.sql
 ```
 
+A segunda migration cria sessões e o registro idempotente de eventos:
+
+```text
+src/main/resources/db/migration/V2__create_parking_sessions_and_webhook_events.sql
+```
+
+A terceira migration adiciona o fingerprint canônico do request aos eventos processados:
+
+```text
+src/main/resources/db/migration/V3__add_webhook_request_fingerprint.sql
+```
+
 ## Datas, horários e logs
 
 Timestamps absolutos, como `created_at` e `updated_at`, são representados por `Instant` e tratados em UTC.
 
 Horários comerciais, como abertura e fechamento dos setores, são representados por `LocalTime` e armazenados exatamente como horários locais, sem conversão de fuso horário.
 
-Em nível `INFO`, a sincronização registra:
-
-- início da operação;
-- quantidade de setores e vagas recebidos;
-- conclusão da validação;
-- resumo final da sincronização.
-
-Em nível `DEBUG`, são registrados os detalhes de cada setor recebido. As vagas não são registradas individualmente, evitando excesso de logs.
+Os logs de inicialização seguem o resumo descrito na estratégia de startup. O processamento não registra payloads completos nem credenciais.
 
 ## Testes e build
 
@@ -301,6 +469,21 @@ Executar o build completo:
 ./gradlew build
 ```
 
+## Validação manual sugerida
+
+Uma sequência mínima para validar o fluxo é:
+
+1. enviar `ENTRY`;
+2. repetir o mesmo request e confirmar `duplicate: true`;
+3. reutilizar a mesma chave com payload diferente e confirmar `409`;
+4. enviar `PARKED` para uma vaga livre;
+5. repetir o `PARKED`;
+6. enviar `EXIT`;
+7. repetir o `EXIT`;
+8. consultar `parking_session` e `processed_webhook_event`.
+
+Ao final, a sessão deve estar em `FINISHED`, a vaga deve estar livre e as duplicidades não devem gerar novos efeitos de domínio.
+
 ## Premissas e decisões técnicas
 
 1. `open_hour`, `close_hour` e `duration_limit_minutes` são persistidos, mas ainda não influenciam o processamento porque o enunciado não define as regras associadas.
@@ -314,7 +497,7 @@ Executar o build completo:
 4. A validação integral ocorre antes da persistência.
 5. Uma configuração inválida interrompe a inicialização.
 6. Identificadores e código são escritos em inglês; logs, mensagens de erro e respostas operacionais são escritos em português.
-7. O simulador é a fonte da verdade da ocupação durante a inicialização nesta versão. Em um sistema produtivo, essa responsabilidade deveria ser alinhada com a área de negócio, pois o estado operacional local pode precisar ser preservado após reinicializações.
+7. O simulador é a fonte da verdade apenas na carga inicial ou no reset explícito. No funcionamento padrão com banco preenchido, o banco preserva integralmente o estado operacional.
 8. Timestamps absolutos são tratados em UTC, enquanto horários comerciais não sofrem conversão de fuso.
 
 ## Evoluções futuras
@@ -325,10 +508,7 @@ As faixas de ocupação e seus respectivos multiplicadores poderão ser armazena
 
 ### Estratégia de sincronização
 
-Poderá existir uma estratégia configurável para escolher entre:
-
-- usar o simulador como fonte da verdade da configuração e da ocupação;
-- preservar o estado operacional local após reinicializações.
+A estratégia atual diferencia carga inicial, retomada do banco e reset explícito. Evoluções futuras podem incluir versionamento de snapshots, auditoria administrativa do reset ou reconciliação seletiva de configuração sem alterar o estado operacional.
 
 ### Regras de horário e permanência
 

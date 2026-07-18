@@ -60,6 +60,16 @@ public class ParkingSpot {
     this.occupied = occupied;
   }
 
+  public void occupy() {
+    if (occupied) throw new IllegalStateException("A vaga já está ocupada.");
+    occupied = true;
+  }
+
+  public void release() {
+    if (!occupied) throw new IllegalStateException("A vaga já está livre.");
+    occupied = false;
+  }
+
   @PrePersist
   void onCreate() {
     createdAt = updatedAt = Instant.now();

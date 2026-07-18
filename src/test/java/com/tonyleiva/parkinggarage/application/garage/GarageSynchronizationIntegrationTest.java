@@ -3,16 +3,29 @@ package com.tonyleiva.parkinggarage.application.garage;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.tonyleiva.parkinggarage.infrastructure.client.GarageConfigurationResponse;
-import com.tonyleiva.parkinggarage.infrastructure.client.GarageSimulatorClient;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.GarageSectorRepository;
+import com.tonyleiva.parkinggarage.infrastructure.persistence.ParkingSessionRepository;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.ParkingSpotRepository;
+import com.tonyleiva.parkinggarage.infrastructure.persistence.ProcessedWebhookEventRepository;
+import com.tonyleiva.parkinggarage.infrastructure.client.GarageSimulatorClient;
+import com.tonyleiva.parkinggarage.infrastructure.config.GarageStartupProperties;
+import com.tonyleiva.parkinggarage.application.webhook.WebhookRequest;
+import com.tonyleiva.parkinggarage.application.webhook.WebhookRequestProcessor;
+import com.tonyleiva.parkinggarage.application.webhook.IdempotencyKeyService;
+import com.tonyleiva.parkinggarage.domain.session.ParkingSession;
+import com.tonyleiva.parkinggarage.domain.session.ParkingSessionStatus;
+import com.tonyleiva.parkinggarage.domain.webhook.WebhookEventType;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,12 +33,16 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.mysql.MySQLContainer;
 
 @Testcontainers
-@SpringBootTest(properties = "garage.synchronization.enabled=false")
+@SpringBootTest(properties = {
+    "spring.flyway.enabled=true",
+    "spring.jpa.hibernate.ddl-auto=validate"
+})
 class GarageSynchronizationIntegrationTest {
 
   @Container static final MySQLContainer MYSQL = new MySQLContainer("mysql:8.4");
@@ -45,13 +62,327 @@ class GarageSynchronizationIntegrationTest {
 
   @Autowired ParkingSpotRepository spotRepository;
 
+  @Autowired ParkingSessionRepository sessionRepository;
+
+  @Autowired ProcessedWebhookEventRepository eventRepository;
+
+  @Autowired WebhookRequestProcessor webhookProcessor;
+
+  @Autowired IdempotencyKeyService idempotencyKeyService;
+
   @Autowired JdbcTemplate jdbcTemplate;
+
+  @MockitoBean GarageStartupService startupService;
 
   @BeforeEach
   void cleanDatabase() {
     jdbcTemplate.execute("DROP TABLE IF EXISTS spot_reference");
+    eventRepository.deleteAll();
+    sessionRepository.deleteAll();
     spotRepository.deleteAll();
     sectorRepository.deleteAll();
+  }
+
+  @Test
+  void shouldApplyAllMigrations() {
+    assertThat(jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM flyway_schema_history WHERE success = TRUE", Integer.class))
+        .isEqualTo(3);
+    assertThat(jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM information_schema.columns"
+            + " WHERE table_schema = DATABASE() AND table_name = 'parking_session'",
+        Integer.class)).isEqualTo(15);
+    assertThat(jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM information_schema.columns"
+            + " WHERE table_schema = DATABASE()"
+            + " AND table_name = 'processed_webhook_event'"
+            + " AND column_name IN ('idempotency_hash', 'request_fingerprint')"
+            + " AND data_type = 'binary' AND character_octet_length = 32"
+            + " AND is_nullable = 'NO'",
+        Integer.class)).isEqualTo(2);
+  }
+
+  @Test
+  void shouldProcessEntryParkedExitAndKeepFinancialValuesExact() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    Instant entry = Instant.parse("2025-01-01T12:00:00Z");
+
+    var entryOutcome = webhookProcessor.process(new WebhookRequest(
+        "zul0001", entry, null, null, null, WebhookEventType.ENTRY), null);
+    var parkedRequest = new WebhookRequest(
+        "ZUL0001", null, null, new BigDecimal("-23.561684"),
+        new BigDecimal("-46.655981"), WebhookEventType.PARKED);
+    var parkedOutcome = webhookProcessor.process(parkedRequest, null);
+    var parkedDuplicate = webhookProcessor.process(parkedRequest, null);
+    var exitRequest = new WebhookRequest(
+        "ZUL0001", null, Instant.parse("2025-01-01T13:10:00Z"), null, null,
+        WebhookEventType.EXIT);
+    var exitOutcome = webhookProcessor.process(exitRequest, "exit-operation-1");
+    var duplicate = webhookProcessor.process(exitRequest, "exit-operation-1");
+
+    var session = sessionRepository.findAll().getFirst();
+    assertThat(entryOutcome.httpStatus()).isEqualTo(200);
+    assertThat(parkedOutcome.httpStatus()).isEqualTo(200);
+    assertThat(parkedDuplicate.duplicate()).isTrue();
+    assertThat(exitOutcome.httpStatus()).isEqualTo(200);
+    assertThat(duplicate.duplicate()).isTrue();
+    assertThat(session.getStatus()).isEqualTo(ParkingSessionStatus.FINISHED);
+    assertThat(session.getBasePrice()).isEqualByComparingTo("40.5000");
+    assertThat(session.getPriceMultiplier()).isEqualByComparingTo("1.10");
+    assertThat(session.getHourlyPrice()).isEqualByComparingTo("44.5500");
+    assertThat(session.getAmount()).isEqualByComparingTo("89.1000");
+    assertThat(spotRepository.findByExternalId(1L).orElseThrow().isOccupied()).isFalse();
+    assertThat(eventRepository.count()).isEqualTo(3);
+  }
+
+  @Test
+  void shouldEnforceOnlyOneActiveSessionPerPlateAndAllowFinishedHistory() {
+    sessionRepository.saveAndFlush(
+        new ParkingSession("ZUL0001", Instant.parse("2025-01-01T10:00:00Z")));
+    assertThatThrownBy(() -> sessionRepository.saveAndFlush(
+        new ParkingSession("ZUL0001", Instant.parse("2025-01-01T11:00:00Z"))))
+        .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+
+    cleanDatabase();
+    jdbcTemplate.update(
+        "INSERT INTO parking_session"
+            + " (license_plate, entry_time, exit_time, amount, status, created_at, updated_at)"
+            + " VALUES (?, ?, ?, ?, 'FINISHED', NOW(6), NOW(6)),"
+            + " (?, ?, ?, ?, 'FINISHED', NOW(6), NOW(6))",
+        "ZUL0001", java.sql.Timestamp.from(Instant.parse("2025-01-01T10:00:00Z")),
+        java.sql.Timestamp.from(Instant.parse("2025-01-01T11:00:00Z")), BigDecimal.ZERO,
+        "ZUL0001", java.sql.Timestamp.from(Instant.parse("2025-01-02T10:00:00Z")),
+        java.sql.Timestamp.from(Instant.parse("2025-01-02T11:00:00Z")), BigDecimal.ZERO);
+    assertThat(sessionRepository.count()).isEqualTo(2);
+  }
+
+  @Test
+  void shouldPersistRejectedEventAndRepeatSameResult() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    var firstRequest = new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY);
+    webhookProcessor.process(firstRequest, "first-entry");
+    var conflictRequest = new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:05:00Z"), null, null, null,
+        WebhookEventType.ENTRY);
+
+    var rejected = webhookProcessor.process(conflictRequest, "conflicting-entry");
+    var duplicate = webhookProcessor.process(conflictRequest, "conflicting-entry");
+
+    assertThat(rejected.httpStatus()).isEqualTo(409);
+    assertThat(rejected.status().name()).isEqualTo("REJECTED");
+    assertThat(duplicate.httpStatus()).isEqualTo(409);
+    assertThat(duplicate.duplicate()).isTrue();
+    assertThat(sessionRepository.count()).isEqualTo(1);
+  }
+
+  @Test
+  void shouldRejectReusedProducerKeyWithDifferentPayloadWithoutSideEffects() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    webhookProcessor.process(new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY), " shared-request ");
+
+    var conflict = webhookProcessor.process(new WebhookRequest(
+        "ZUL0002", Instant.parse("2025-01-01T12:05:00Z"), null, null, null,
+        WebhookEventType.ENTRY), "shared-request");
+
+    assertThat(conflict.httpStatus()).isEqualTo(409);
+    assertThat(conflict.message())
+        .isEqualTo("A chave de idempotência já foi utilizada para outra requisição.");
+    assertThat(sessionRepository.count()).isEqualTo(1);
+    assertThat(eventRepository.count()).isEqualTo(1);
+    assertThat(eventRepository.findAll().getFirst().getIdempotencyKey())
+        .isEqualTo("shared-request");
+  }
+
+  @Test
+  void shouldRejectReusedProducerKeyWithDifferentEventType() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    webhookProcessor.process(new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY), "cross-event-request");
+
+    var conflict = webhookProcessor.process(new WebhookRequest(
+        "ZUL0001", null, Instant.parse("2025-01-01T13:00:00Z"), null, null,
+        WebhookEventType.EXIT), "cross-event-request");
+
+    assertThat(conflict.httpStatus()).isEqualTo(409);
+    assertThat(sessionRepository.countByStatus(ParkingSessionStatus.ENTERED)).isEqualTo(1);
+    assertThat(eventRepository.count()).isEqualTo(1);
+  }
+
+  @Test
+  void shouldPersistCanonicalRequestFingerprint() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    var request = new WebhookRequest(
+        "zul0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY);
+    webhookProcessor.process(request, "fingerprint-request");
+
+    assertThat(eventRepository.findAll().getFirst().getRequestFingerprint())
+        .hasSize(32)
+        .isEqualTo(idempotencyKeyService.fingerprint(request, "ZUL0001"));
+  }
+
+  @Test
+  void shouldUseNoActiveSessionMarkerAndAllowFutureSessionAtSameCoordinates() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    var parked = new WebhookRequest(
+        "ZUL0001", null, null, new BigDecimal("-23.56168400"),
+        new BigDecimal("-46.65598100"), WebhookEventType.PARKED);
+
+    var rejected = webhookProcessor.process(parked, null);
+    var repeated = webhookProcessor.process(parked, null);
+    createEntry("ZUL0001", "2025-01-01T12:00:00Z", "future-entry");
+    var processed = webhookProcessor.process(parked, null);
+
+    assertThat(rejected.httpStatus()).isEqualTo(404);
+    assertThat(repeated.duplicate()).isTrue();
+    assertThat(processed.httpStatus()).isEqualTo(200);
+    assertThat(eventRepository.findAll())
+        .extracting(event -> event.getIdempotencyKey())
+        .contains(
+            "PARKED|ZUL0001|NO_ACTIVE_SESSION|-23.561684|-46.655981",
+            "PARKED|ZUL0001|2025-01-01T12:00:00Z|-23.561684|-46.655981");
+    assertThat(sessionRepository.countByStatus(ParkingSessionStatus.PARKED)).isEqualTo(1);
+  }
+
+  @Test
+  void shouldHandleConcurrentRequestsWithTheSameProducerKeyAsOneLogicalRequest()
+      throws Exception {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    var request = new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY);
+    var executor = Executors.newFixedThreadPool(2);
+    try {
+      var first = executor.submit(() -> webhookProcessor.process(request, "same-concurrent-key"));
+      var second = executor.submit(() -> webhookProcessor.process(request, "same-concurrent-key"));
+      var outcomes = List.of(
+          first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
+
+      assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.httpStatus()).isEqualTo(200));
+      assertThat(outcomes).extracting(outcome -> outcome.duplicate())
+          .containsExactlyInAnyOrder(false, true);
+      assertThat(sessionRepository.count()).isEqualTo(1);
+      assertThat(eventRepository.count()).isEqualTo(1);
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void shouldSerializeConcurrentEntriesNearGlobalCapacity() throws Exception {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    var executor = Executors.newFixedThreadPool(2);
+    try {
+      var first = executor.submit(() -> webhookProcessor.process(new WebhookRequest(
+          "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+          WebhookEventType.ENTRY), "concurrent-entry-1"));
+      var second = executor.submit(() -> webhookProcessor.process(new WebhookRequest(
+          "ZUL0002", Instant.parse("2025-01-01T12:00:01Z"), null, null, null,
+          WebhookEventType.ENTRY), "concurrent-entry-2"));
+
+      assertThat(List.of(first.get(10, TimeUnit.SECONDS).httpStatus(),
+          second.get(10, TimeUnit.SECONDS).httpStatus()))
+          .containsExactlyInAnyOrder(200, 409);
+      assertThat(sessionRepository.countByStatus(ParkingSessionStatus.ENTERED)).isEqualTo(1);
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void shouldLoadInitialSnapshotWhenResetIsFalseAndDatabaseIsEmpty() {
+    GarageSimulatorClient client = mock(GarageSimulatorClient.class);
+    when(client.fetchConfiguration()).thenReturn(GarageConfigurationFixtures.valid());
+    var service = new GarageStartupService(
+        client, validator, persistenceService, new GarageStartupProperties(false));
+
+    service.initialize();
+
+    verify(client).fetchConfiguration();
+    assertThat(sectorRepository.count()).isEqualTo(1);
+    assertThat(spotRepository.count()).isEqualTo(2);
+  }
+
+  @Test
+  void shouldContinueFromDatabaseWithoutSimulatorWhenResetIsFalse() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    GarageSimulatorClient client = mock(GarageSimulatorClient.class);
+    var service = new GarageStartupService(
+        client, validator, persistenceService, new GarageStartupProperties(false));
+
+    service.initialize();
+
+    verify(client, never()).fetchConfiguration();
+    assertThat(spotRepository.findByExternalId(2L).orElseThrow().isOccupied()).isTrue();
+  }
+
+  @Test
+  void shouldReplaceAllStateFromValidatedSnapshotWhenResetIsTrue() {
+    persistenceService.replaceAll(validator.validate(GarageConfigurationFixtures.valid()));
+    webhookProcessor.process(new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY), "reset-entry");
+    GarageSimulatorClient client = mock(GarageSimulatorClient.class);
+    var replacement = configuration(
+        List.of(sector("B", 1)),
+        List.of(spot(10L, "B", "-22.00000000", "-45.00000000", false)));
+    when(client.fetchConfiguration()).thenReturn(replacement);
+    var service = new GarageStartupService(
+        client, validator, persistenceService, new GarageStartupProperties(true));
+
+    service.initialize();
+
+    assertThat(eventRepository.count()).isZero();
+    assertThat(sessionRepository.count()).isZero();
+    assertThat(sectorRepository.findByCode("A")).isEmpty();
+    assertThat(sectorRepository.findByCode("B")).isPresent();
+    assertThat(spotRepository.findByExternalId(10L)).isPresent();
+  }
+
+  @Test
+  void shouldSerializeConcurrentParkingInDifferentSpotsOfTheSameSector() throws Exception {
+    persistenceService.replaceAll(validator.validate(allFreeSnapshot()));
+    createEntry("ZUL0001", "2025-01-01T12:00:00Z", "entry-parking-1");
+    createEntry("ZUL0002", "2025-01-01T12:00:01Z", "entry-parking-2");
+    var executor = Executors.newFixedThreadPool(2);
+    try {
+      var first = executor.submit(() -> park(
+          "ZUL0001", "-23.56168400", "-46.65598100", "parking-1"));
+      var second = executor.submit(() -> park(
+          "ZUL0002", "-23.56168501", "-46.65598201", "parking-2"));
+      assertThat(List.of(first.get(10, TimeUnit.SECONDS).httpStatus(),
+          second.get(10, TimeUnit.SECONDS).httpStatus())).containsOnly(200);
+      assertThat(sessionRepository.findAll())
+          .extracting(ParkingSession::getPriceMultiplier)
+          .containsExactlyInAnyOrder(new BigDecimal("0.90"), new BigDecimal("1.10"));
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void shouldAllowOnlyOneConcurrentParkingOperationForTheSameSpot() throws Exception {
+    persistenceService.replaceAll(validator.validate(allFreeSnapshot()));
+    createEntry("ZUL0001", "2025-01-01T12:00:00Z", "same-spot-entry-1");
+    createEntry("ZUL0002", "2025-01-01T12:00:01Z", "same-spot-entry-2");
+    var executor = Executors.newFixedThreadPool(2);
+    try {
+      var first = executor.submit(() -> park(
+          "ZUL0001", "-23.56168400", "-46.65598100", "same-spot-1"));
+      var second = executor.submit(() -> park(
+          "ZUL0002", "-23.56168400", "-46.65598100", "same-spot-2"));
+      assertThat(List.of(first.get(10, TimeUnit.SECONDS).httpStatus(),
+          second.get(10, TimeUnit.SECONDS).httpStatus()))
+          .containsExactlyInAnyOrder(200, 409);
+      assertThat(sessionRepository.countByStatus(ParkingSessionStatus.PARKED)).isEqualTo(1);
+    } finally {
+      executor.shutdownNow();
+    }
   }
 
   @Test
@@ -171,7 +502,7 @@ class GarageSynchronizationIntegrationTest {
 
     assertThatThrownBy(() -> persistenceService.synchronize(validator.validate(latest)))
         .isInstanceOf(GarageReconciliationException.class)
-        .hasMessageContaining("registros obsoletos do tipo vagas")
+        .hasMessageContaining("nenhuma alteração foi aplicada")
         .hasCauseInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
     assertThat(spotRepository.count()).isEqualTo(2);
     assertThat(sectorRepository.findByCode("A").orElseThrow().getMaxCapacity()).isEqualTo(2);
@@ -182,12 +513,7 @@ class GarageSynchronizationIntegrationTest {
     var valid = GarageConfigurationFixtures.valid();
     var invalid =
         new GarageConfigurationResponse(valid.garage(), List.of(valid.spots().getFirst()));
-    GarageSimulatorClient client = mock(GarageSimulatorClient.class);
-    when(client.fetchConfiguration()).thenReturn(invalid);
-    GarageSynchronizationService service =
-        new GarageSynchronizationService(client, validator, persistenceService);
-
-    assertThatThrownBy(service::synchronize)
+    assertThatThrownBy(() -> persistenceService.synchronize(validator.validate(invalid)))
         .isInstanceOf(InvalidGarageConfigurationException.class);
     assertThat(sectorRepository.count()).isZero();
     assertThat(spotRepository.count()).isZero();
@@ -225,6 +551,26 @@ class GarageSynchronizationIntegrationTest {
       List<GarageConfigurationResponse.SectorResponse> sectors,
       List<GarageConfigurationResponse.SpotResponse> spots) {
     return new GarageConfigurationResponse(sectors, spots);
+  }
+
+  private GarageConfigurationResponse allFreeSnapshot() {
+    return configuration(
+        List.of(sector("A", 2)),
+        List.of(
+            spot(1L, "A", "-23.56168400", "-46.65598100", false),
+            spot(2L, "A", "-23.56168501", "-46.65598201", false)));
+  }
+
+  private void createEntry(String plate, String entryTime, String key) {
+    webhookProcessor.process(new WebhookRequest(
+        plate, Instant.parse(entryTime), null, null, null, WebhookEventType.ENTRY), key);
+  }
+
+  private com.tonyleiva.parkinggarage.application.webhook.WebhookOutcome park(
+      String plate, String latitude, String longitude, String key) {
+    return webhookProcessor.process(new WebhookRequest(
+        plate, null, null, new BigDecimal(latitude), new BigDecimal(longitude),
+        WebhookEventType.PARKED), key);
   }
 
   private GarageConfigurationResponse.SectorResponse sector(String code, int capacity) {

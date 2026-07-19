@@ -23,6 +23,10 @@ Ainda não fazem parte deste escopo:
 - Mockito
 - Testcontainers
 
+## Qualidade e integração contínua
+
+O GitHub Actions executa os testes automatizados, gera os relatórios de cobertura com o JaCoCo e envia a análise ao SonarQube Cloud. A cobertura é importada pelo relatório XML do JaCoCo, e o Quality Gate pode impedir o merge quando os critérios de qualidade não forem atendidos. O `SONAR_TOKEN` permanece armazenado como secret no GitHub e não é incluído no repositório.
+
 ## Arquitetura
 
 O projeto utiliza uma arquitetura em camadas inspirada em Clean Architecture e Arquitetura Hexagonal, separando regras de domínio, orquestração da aplicação, integrações de infraestrutura e apresentação HTTP, sem adicionar abstrações desnecessárias para o tamanho da solução.

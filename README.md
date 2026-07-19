@@ -4,11 +4,7 @@ Backend responsável por inicializar e gerenciar a operação de uma garagem, pr
 
 ## Escopo atual
 
-Esta etapa implementa a inicialização controlada da garagem e o webhook dos eventos `ENTRY`, `PARKED` e `EXIT`, incluindo idempotência, concorrência, preço dinâmico e cálculo do valor da permanência.
-
-Ainda não fazem parte deste escopo:
-
-- consulta de receita em `/revenue`.
+Esta etapa implementa a inicialização controlada da garagem, o webhook dos eventos `ENTRY`, `PARKED` e `EXIT` e a consulta diária de receita, incluindo idempotência, concorrência, preço dinâmico e cálculo do valor da permanência.
 
 ## Stack
 
@@ -264,6 +260,7 @@ A aplicação expõe atualmente:
 | Método | Endpoint | Descrição |
 |---|---|---|
 | `POST` | `/webhook` | Recebe eventos `ENTRY`, `PARKED` e `EXIT` |
+| `GET` | `/revenue` | Consulta a receita diária de um setor pelo dia do `EXIT` |
 
 O endpoint `GET /garage` pertence ao simulador externo, disponível por padrão em `http://localhost:3000/garage`.
 
@@ -314,7 +311,7 @@ As coordenadas são armazenadas como valores decimais de escala fixa. Zeros fina
 }
 ```
 
-Libera a vaga, calcula e persiste `amount` e finaliza a sessão. `/revenue` não está implementado nesta etapa.
+Libera a vaga, calcula e persiste `amount` e finaliza a sessão.
 
 ### Exemplos com curl
 
@@ -371,6 +368,23 @@ O preço é calculado antes de ocupar a nova vaga e congelado na sessão:
 | `100%` | setor lotado |
 
 Multiplicadores usam escala 2; preços e valores usam escala 4 e `HALF_UP`. Até 30 minutos, inclusive, o valor é zero. Depois disso, cobra-se desde a primeira hora, usando o teto da duração total: 31 minutos custam uma hora, 60 minutos custam uma hora, `60:00.001` custa duas horas e 70 minutos custam duas horas.
+
+## Consulta de receita
+
+Por compatibilidade com o contrato do desafio, `GET /revenue` recebe um body JSON:
+
+```json
+{
+  "date": "2025-01-01",
+  "sector": "A"
+}
+```
+
+A receita soma os valores persistidos no `EXIT` das sessões finalizadas do setor. A data representa o dia do `EXIT` em `America/Sao_Paulo`; o retorno usa `BRL` e inclui o instante UTC da consulta.
+
+Valores financeiros são mantidos internamente com quatro casas decimais. O faturamento soma os valores persistidos com sua precisão original e somente o total apresentado pela API é arredondado para duas casas com `HALF_UP`. Essa decisão atende às duas casas exigidas na resposta pelo enunciado, que não define o tratamento de frações de centavo.
+
+No fluxo operacional, `ENTRY` consome capacidade global sem ocupar uma vaga específica. `PARKED` define a vaga e o setor e congela o preço dinâmico. A cobrança considera todo o intervalo entre `ENTRY` e `EXIT`.
 
 ## Idempotência
 
@@ -504,7 +518,25 @@ Ao final, a sessão deve estar em `FINISHED`, a vaga deve estar livre e as dupli
 7. O simulador é a fonte da verdade apenas na carga inicial ou no reset explícito. No funcionamento padrão com banco preenchido, o banco preserva integralmente o estado operacional.
 8. Timestamps absolutos são tratados em UTC, enquanto horários comerciais não sofrem conversão de fuso.
 
+### Premissas sobre ENTRY e PARKED
+
+O evento `ENTRY` informa apenas a placa e o horário de entrada, sem setor, vaga ou coordenadas.
+
+Por esse motivo:
+
+- a entrada já é contabilizada na capacidade total da garagem;
+- nenhuma vaga específica é ocupada nesse momento;
+- a vaga e o setor são definidos no evento `PARKED`, quando as coordenadas passam a estar disponíveis;
+- o preço dinâmico é congelado no `PARKED`, primeiro momento em que o setor pode ser identificado;
+- o cálculo da cobrança utiliza todo o período entre `ENTRY` e `EXIT`.
+
+Essa decisão preserva a regra de cobrança desde a entrada e evita inventar uma estratégia de seleção de setor não definida no enunciado.
+
 ## Evoluções futuras
+
+### Contrato HTTP da receita
+
+Uma evolução poderá mover `date` e `sector` para query parameters. Embora preservado nesta entrega por compatibilidade com o desafio, um body em `GET` não possui semântica geralmente definida no padrão HTTP e pode ter suporte inconsistente entre clientes, proxies e caches.
 
 ### Configuração do preço dinâmico
 
@@ -521,3 +553,23 @@ Após alinhamento com a área de negócio, poderão ser implementados:
 - bloqueio ou sinalização de estacionamento fora do horário do setor;
 - tratamento de veículos acima de `duration_limit_minutes`;
 - alertas, cobranças adicionais ou abertura de ocorrências.
+
+### Saída sem estacionamento confirmado
+
+Atualmente, o fluxo exige a sequência:
+
+`ENTRY → PARKED → EXIT`
+
+Foi identificado o cenário em que um veículo entra na garagem, não encontra vaga no setor desejado, por exemplo, e sai sem receber um evento `PARKED`.
+
+A capacidade global já é comprometida no momento do `ENTRY`. Entretanto, esse fluxo alternativo não foi implementado porque o enunciado não define:
+
+- se a saída direta deve ser permitida;
+- se deve haver gratuidade;
+- qual seria o tempo máximo de tolerância;
+- se deve existir cobrança após esse período;
+- em qual condição a sessão deve ser finalizada e a capacidade global liberada.
+
+Antes de permitir `EXIT` diretamente após `ENTRY`, essa regra deveria ser validada com a área de negócio.
+
+Uma possível evolução seria permitir `ENTRY → EXIT` dentro de uma janela de tolerância, finalizando a sessão, liberando a capacidade global e não gerando cobrança.

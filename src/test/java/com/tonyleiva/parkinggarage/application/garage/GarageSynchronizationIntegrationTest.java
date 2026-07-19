@@ -7,22 +7,26 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.tonyleiva.parkinggarage.application.revenue.RevenueService;
+import com.tonyleiva.parkinggarage.application.webhook.IdempotencyKeyService;
+import com.tonyleiva.parkinggarage.application.webhook.WebhookRequest;
+import com.tonyleiva.parkinggarage.application.webhook.WebhookRequestProcessor;
+import com.tonyleiva.parkinggarage.domain.session.ParkingSession;
+import com.tonyleiva.parkinggarage.domain.session.ParkingSessionStatus;
+import com.tonyleiva.parkinggarage.domain.webhook.WebhookEventType;
+import com.tonyleiva.parkinggarage.infrastructure.client.GarageSimulatorClient;
 import com.tonyleiva.parkinggarage.infrastructure.client.GarageConfigurationResponse;
+import com.tonyleiva.parkinggarage.infrastructure.config.GarageStartupProperties;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.GarageSectorRepository;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.ParkingSessionRepository;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.ParkingSpotRepository;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.ProcessedWebhookEventRepository;
-import com.tonyleiva.parkinggarage.infrastructure.client.GarageSimulatorClient;
-import com.tonyleiva.parkinggarage.infrastructure.config.GarageStartupProperties;
-import com.tonyleiva.parkinggarage.application.webhook.WebhookRequest;
-import com.tonyleiva.parkinggarage.application.webhook.WebhookRequestProcessor;
-import com.tonyleiva.parkinggarage.application.webhook.IdempotencyKeyService;
-import com.tonyleiva.parkinggarage.domain.session.ParkingSession;
-import com.tonyleiva.parkinggarage.domain.session.ParkingSessionStatus;
-import com.tonyleiva.parkinggarage.domain.webhook.WebhookEventType;
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +48,8 @@ import org.testcontainers.mysql.MySQLContainer;
     "spring.jpa.hibernate.ddl-auto=validate"
 })
 class GarageSynchronizationIntegrationTest {
+  private static final Instant FIXED_INSTANT = Instant.parse("2025-01-03T12:00:00Z");
+  private static final Clock FIXED_CLOCK = Clock.fixed(FIXED_INSTANT, ZoneOffset.UTC);
 
   @Container static final MySQLContainer MYSQL = new MySQLContainer("mysql:8.4");
 
@@ -70,12 +76,17 @@ class GarageSynchronizationIntegrationTest {
 
   @Autowired IdempotencyKeyService idempotencyKeyService;
 
+  @Autowired RevenueService revenueService;
+
   @Autowired JdbcTemplate jdbcTemplate;
 
   @MockitoBean GarageStartupService startupService;
 
+  @MockitoBean Clock clock;
+
   @BeforeEach
   void cleanDatabase() {
+    when(clock.instant()).thenReturn(FIXED_CLOCK.instant());
     jdbcTemplate.execute("DROP TABLE IF EXISTS spot_reference");
     eventRepository.deleteAll();
     sessionRepository.deleteAll();
@@ -292,6 +303,116 @@ class GarageSynchronizationIntegrationTest {
     } finally {
       executor.shutdownNow();
     }
+  }
+
+  @Test
+  void shouldReserveGlobalCapacityOnEntryAndReleaseItAfterExit() {
+    persistenceService.replaceAll(validator.validate(allFreeSnapshot()));
+
+    var firstEntry = webhookProcessor.process(new WebhookRequest(
+        "ZUL0001", Instant.parse("2025-01-01T12:00:00Z"), null, null, null,
+        WebhookEventType.ENTRY), "capacity-entry-1");
+    var secondEntry = webhookProcessor.process(new WebhookRequest(
+        "ZUL0002", Instant.parse("2025-01-01T12:00:01Z"), null, null, null,
+        WebhookEventType.ENTRY), "capacity-entry-2");
+
+    assertThat(firstEntry.httpStatus()).isEqualTo(200);
+    assertThat(secondEntry.httpStatus()).isEqualTo(200);
+    assertThat(sessionRepository.countByStatus(ParkingSessionStatus.ENTERED)).isEqualTo(2);
+    assertThat(spotRepository.countByOccupiedTrue()).isZero();
+
+    var rejectedEntry = webhookProcessor.process(new WebhookRequest(
+        "ZUL0003", Instant.parse("2025-01-01T12:00:02Z"), null, null, null,
+        WebhookEventType.ENTRY), "capacity-entry-3-rejected");
+    assertThat(rejectedEntry.httpStatus()).isEqualTo(409);
+    assertThat(rejectedEntry.message()).isEqualTo("A garagem está cheia.");
+
+    var parked = park("ZUL0001", "-23.56168400", "-46.65598100", "capacity-parked-1");
+    var exit = webhookProcessor.process(new WebhookRequest(
+        "ZUL0001", null, Instant.parse("2025-01-01T13:00:00Z"), null, null,
+        WebhookEventType.EXIT), "capacity-exit-1");
+
+    assertThat(parked.httpStatus()).isEqualTo(200);
+    assertThat(exit.httpStatus()).isEqualTo(200);
+    assertThat(sessionRepository.findAll())
+        .filteredOn(session -> session.getLicensePlate().equals("ZUL0001"))
+        .extracting(ParkingSession::getStatus)
+        .containsExactly(ParkingSessionStatus.FINISHED);
+    assertThat(sessionRepository.findAll())
+        .filteredOn(session -> session.getLicensePlate().equals("ZUL0002"))
+        .extracting(ParkingSession::getStatus)
+        .containsExactly(ParkingSessionStatus.ENTERED);
+    assertThat(spotRepository.findByExternalId(1L).orElseThrow().isOccupied()).isFalse();
+
+    var acceptedEntry = webhookProcessor.process(new WebhookRequest(
+        "ZUL0003", Instant.parse("2025-01-01T12:00:02Z"), null, null, null,
+        WebhookEventType.ENTRY), "capacity-entry-3-accepted");
+
+    assertThat(acceptedEntry.httpStatus()).isEqualTo(200);
+    assertThat(sessionRepository.findAll())
+        .filteredOn(session -> session.getStatus() != ParkingSessionStatus.FINISHED)
+        .extracting(ParkingSession::getLicensePlate)
+        .containsExactlyInAnyOrder("ZUL0002", "ZUL0003");
+  }
+
+  @Test
+  void shouldAggregateFinishedRevenueByExitDayInSaoPaulo() {
+    persistenceService.replaceAll(validator.validate(revenueSnapshot()));
+    Long sectorA = sectorRepository.findByCode("A").orElseThrow().getId();
+    Long sectorB = sectorRepository.findByCode("B").orElseThrow().getId();
+    insertSession("ZUL1001", sectorA, "FINISHED", "2025-01-01T03:00:00Z", "10.0000");
+    insertSession("ZUL1002", sectorA, "FINISHED", "2025-01-02T02:59:59.999999Z", "79.1000");
+    insertSession("ZUL1003", sectorA, "FINISHED", "2025-01-01T02:59:59.999999Z", "100.0000");
+    insertSession("ZUL1004", sectorA, "FINISHED", "2025-01-02T03:00:00Z", "100.0000");
+    insertSession("ZUL1005", sectorB, "FINISHED", "2025-01-01T12:00:00Z", "100.0000");
+    insertSession("ZUL1006", sectorA, "ENTERED", "2025-01-01T12:00:00Z", "100.0000");
+    insertSession("ZUL1007", sectorA, "PARKED", "2025-01-01T12:00:00Z", "100.0000");
+
+    var result = revenueService.calculate("2025-01-01", "A");
+
+    assertThat(result.amount()).isEqualByComparingTo("89.10");
+    assertThat(result.amount().scale()).isEqualTo(2);
+    assertThat(result.currency()).isEqualTo("BRL");
+    assertThat(result.timestamp()).isEqualTo(FIXED_INSTANT);
+  }
+
+  @Test
+  void shouldReturnZeroRevenueWhenThereAreNoFinishedSessionsInTheRequestedDay() {
+    persistenceService.replaceAll(validator.validate(revenueSnapshot()));
+
+    var result = revenueService.calculate("2025-01-03", "A");
+
+    assertThat(result.amount()).isEqualByComparingTo("0.00");
+    assertThat(result.amount().scale()).isEqualTo(2);
+  }
+
+  @Test
+  void shouldRoundOnePersistedFractionalCentOnlyWhenPresentingRevenue() {
+    persistenceService.replaceAll(validator.validate(revenueSnapshot()));
+    Long sectorA = sectorRepository.findByCode("A").orElseThrow().getId();
+    insertSession("ZUL2001", sectorA, "FINISHED", "2025-01-01T12:00:00Z", "50.6250");
+
+    var persistedSum = sumRevenueForJanuaryFirst("A");
+    var result = revenueService.calculate("2025-01-01", "A");
+
+    assertThat(persistedSum).isEqualByComparingTo("50.6250");
+    assertThat(result.amount()).isEqualByComparingTo("50.63");
+    assertThat(result.amount().scale()).isEqualTo(2);
+  }
+
+  @Test
+  void shouldSumPersistedFractionalCentsBeforeRoundingRevenue() {
+    persistenceService.replaceAll(validator.validate(revenueSnapshot()));
+    Long sectorA = sectorRepository.findByCode("A").orElseThrow().getId();
+    insertSession("ZUL2001", sectorA, "FINISHED", "2025-01-01T12:00:00Z", "50.6250");
+    insertSession("ZUL2002", sectorA, "FINISHED", "2025-01-01T13:00:00Z", "50.6250");
+
+    var persistedSum = sumRevenueForJanuaryFirst("A");
+    var result = revenueService.calculate("2025-01-01", "A");
+
+    assertThat(persistedSum).isEqualByComparingTo("101.2500");
+    assertThat(result.amount()).isEqualByComparingTo("101.25");
+    assertThat(result.amount()).isNotEqualByComparingTo("101.26");
   }
 
   @Test
@@ -559,6 +680,36 @@ class GarageSynchronizationIntegrationTest {
         List.of(
             spot(1L, "A", "-23.56168400", "-46.65598100", false),
             spot(2L, "A", "-23.56168501", "-46.65598201", false)));
+  }
+
+  private GarageConfigurationResponse revenueSnapshot() {
+    return configuration(
+        List.of(sector("A", 1), sector("B", 1)),
+        List.of(
+            spot(1L, "A", "-23.56168400", "-46.65598100", false),
+            spot(2L, "B", "-23.56168501", "-46.65598201", false)));
+  }
+
+  private void insertSession(
+      String plate, Long sectorId, String status, String exitTime, String amount) {
+    jdbcTemplate.update(
+        "INSERT INTO parking_session"
+            + " (license_plate, sector_id, entry_time, exit_time, amount, status,"
+            + " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+        plate,
+        sectorId,
+        LocalDateTime.ofInstant(Instant.parse("2024-12-31T00:00:00Z"), ZoneOffset.UTC),
+        LocalDateTime.ofInstant(Instant.parse(exitTime), ZoneOffset.UTC),
+        new BigDecimal(amount),
+        status);
+  }
+
+  private BigDecimal sumRevenueForJanuaryFirst(String sectorCode) {
+    return sessionRepository.sumAmountBySectorAndStatusAndExitTime(
+        sectorCode,
+        ParkingSessionStatus.FINISHED,
+        Instant.parse("2025-01-01T03:00:00Z"),
+        Instant.parse("2025-01-02T03:00:00Z"));
   }
 
   private void createEntry(String plate, String entryTime, String key) {

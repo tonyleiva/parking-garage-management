@@ -32,6 +32,11 @@ class ParkingFeePolicyTest {
   }
 
   @Test
+  void shouldChargeTwoHoursAtSixtyOneMinutes() {
+    assertAmount("2025-01-01T13:01:00Z", "81.0000");
+  }
+
+  @Test
   void shouldChargeTwoHoursAtSeventyMinutes() {
     assertAmount("2025-01-01T13:10:00Z", "81.0000");
   }

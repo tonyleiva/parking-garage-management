@@ -1,5 +1,7 @@
 package com.tonyleiva.parkinggarage.presentation.error;
 
+import com.tonyleiva.parkinggarage.application.revenue.InvalidRevenueRequestException;
+import com.tonyleiva.parkinggarage.application.revenue.SectorNotFoundException;
 import com.tonyleiva.parkinggarage.application.webhook.InvalidWebhookPayloadException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +20,17 @@ public class GlobalExceptionHandler {
     String message = exception instanceof InvalidWebhookPayloadException
         ? exception.getMessage() : "O payload informado é inválido.";
     return ResponseEntity.badRequest().body(new ErrorResponse("INVALID", message));
+  }
+
+  @ExceptionHandler(InvalidRevenueRequestException.class)
+  ResponseEntity<ErrorResponse> invalidRevenueRequest(InvalidRevenueRequestException exception) {
+    return ResponseEntity.badRequest().body(new ErrorResponse("INVALID", exception.getMessage()));
+  }
+
+  @ExceptionHandler(SectorNotFoundException.class)
+  ResponseEntity<ErrorResponse> sectorNotFound(SectorNotFoundException exception) {
+    return ResponseEntity.status(HttpStatus.NOT_FOUND)
+        .body(new ErrorResponse("NOT_FOUND", exception.getMessage()));
   }
 
   @ExceptionHandler(Exception.class)

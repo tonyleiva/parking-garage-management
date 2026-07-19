@@ -1,6 +1,6 @@
 garage:
-  synchronization:
-    enabled: false
+  startup:
+    reset-from-simulator: false
 
 spring:
   jpa:

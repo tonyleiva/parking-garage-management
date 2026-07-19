@@ -3,11 +3,12 @@ package com.tonyleiva.parkinggarage.application.garage;
 import com.tonyleiva.parkinggarage.domain.sector.GarageSector;
 import com.tonyleiva.parkinggarage.domain.spot.ParkingSpot;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.GarageSectorRepository;
+import com.tonyleiva.parkinggarage.infrastructure.persistence.ParkingSessionRepository;
 import com.tonyleiva.parkinggarage.infrastructure.persistence.ParkingSpotRepository;
+import com.tonyleiva.parkinggarage.infrastructure.persistence.ProcessedWebhookEventRepository;
+import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -16,107 +17,104 @@ import org.springframework.transaction.annotation.Transactional;
 public class GaragePersistenceService {
   private final GarageSectorRepository sectorRepository;
   private final ParkingSpotRepository spotRepository;
+  private final ParkingSessionRepository sessionRepository;
+  private final ProcessedWebhookEventRepository eventRepository;
 
   public GaragePersistenceService(
-      GarageSectorRepository sectorRepository, ParkingSpotRepository spotRepository) {
+      GarageSectorRepository sectorRepository,
+      ParkingSpotRepository spotRepository,
+      ParkingSessionRepository sessionRepository,
+      ProcessedWebhookEventRepository eventRepository) {
     this.sectorRepository = sectorRepository;
     this.spotRepository = spotRepository;
+    this.sessionRepository = sessionRepository;
+    this.eventRepository = eventRepository;
+  }
+
+  @Transactional(readOnly = true)
+  public boolean isEmpty() {
+    return sectorRepository.count() == 0 && spotRepository.count() == 0;
+  }
+
+  @Transactional(readOnly = true)
+  public void validateStoredConfiguration() {
+    long sectors = sectorRepository.count();
+    long spots = spotRepository.count();
+    if (sectors == 0 || spots == 0) {
+      throw new GarageReconciliationException(
+          "O estado persistido da garagem está incompleto e não pode ser retomado.", null);
+    }
   }
 
   @Transactional
-  public void synchronize(ValidatedGarageConfiguration configuration) {
-    removeObsoleteSpots(configuration);
-
-    Map<String, GarageSector> sectors = new HashMap<>();
-    for (var data : configuration.sectors()) {
-      GarageSector sector =
-          sectorRepository
-              .findByCode(data.code())
-              .orElseGet(
-                  () ->
-                      new GarageSector(
-                          data.code(),
-                          data.basePrice(),
-                          data.maxCapacity(),
-                          data.openHour(),
-                          data.closeHour(),
-                          data.durationLimitMinutes()));
-      sector.update(
-          data.basePrice(),
-          data.maxCapacity(),
-          data.openHour(),
-          data.closeHour(),
-          data.durationLimitMinutes());
-      sectors.put(data.code(), sectorRepository.save(sector));
-    }
-
-    for (var data : configuration.spots()) {
-      ParkingSpot spot =
-          spotRepository
-              .findByExternalId(data.externalId())
-              .orElseGet(
-                  () ->
-                      new ParkingSpot(
-                          data.externalId(),
-                          sectors.get(data.sectorCode()),
-                          data.latitude(),
-                          data.longitude(),
-                          data.occupied()));
-      spot.update(
-          sectors.get(data.sectorCode()), data.latitude(), data.longitude(), data.occupied());
-      spotRepository.save(spot);
-    }
-
-    spotRepository.flush();
-    removeObsoleteSectors(configuration);
-  }
-
-  private void removeObsoleteSpots(ValidatedGarageConfiguration configuration) {
-    Set<Long> currentExternalIds = new HashSet<>();
-    configuration.spots().forEach(spot -> currentExternalIds.add(spot.externalId()));
-    var obsoleteSpots =
-        spotRepository.findAll().stream()
-            .filter(spot -> !currentExternalIds.contains(spot.getExternalId()))
-            .toList();
-
-    if (obsoleteSpots.isEmpty()) {
-      return;
-    }
-
+  public GarageStateSummary replaceAll(ValidatedGarageConfiguration configuration) {
     try {
-      spotRepository.deleteAllInBatch(obsoleteSpots);
+      eventRepository.deleteAllInBatch();
+      sessionRepository.deleteAllInBatch();
+      spotRepository.deleteAllInBatch();
+      sectorRepository.deleteAllInBatch();
+      eventRepository.flush();
+      sessionRepository.flush();
       spotRepository.flush();
-    } catch (DataIntegrityViolationException exception) {
-      throw reconciliationFailure("vagas", exception);
-    }
-  }
-
-  private void removeObsoleteSectors(ValidatedGarageConfiguration configuration) {
-    Set<String> currentCodes = new HashSet<>();
-    configuration.sectors().forEach(sector -> currentCodes.add(sector.code()));
-    var obsoleteSectors =
-        sectorRepository.findAll().stream()
-            .filter(sector -> !currentCodes.contains(sector.getCode()))
-            .toList();
-
-    if (obsoleteSectors.isEmpty()) {
-      return;
-    }
-
-    try {
-      sectorRepository.deleteAllInBatch(obsoleteSectors);
       sectorRepository.flush();
+
+      Map<String, GarageSector> sectors = new HashMap<>();
+      for (var data : configuration.sectors()) {
+        GarageSector sector =
+            sectorRepository.save(
+                new GarageSector(
+                    data.code(),
+                    data.basePrice(),
+                    data.maxCapacity(),
+                    data.openHour(),
+                    data.closeHour(),
+                    data.durationLimitMinutes()));
+        sectors.put(data.code(), sector);
+      }
+      for (var data : configuration.spots()) {
+        spotRepository.save(
+            new ParkingSpot(
+                data.externalId(),
+                sectors.get(data.sectorCode()),
+                data.latitude(),
+                data.longitude(),
+                data.occupied()));
+      }
+      spotRepository.flush();
+      return summarizeInternal();
     } catch (DataIntegrityViolationException exception) {
-      throw reconciliationFailure("setores", exception);
+      throw new GarageReconciliationException(
+          "Não foi possível substituir o estado da garagem; nenhuma alteração foi aplicada.",
+          exception);
     }
   }
 
-  private GarageReconciliationException reconciliationFailure(
-      String recordType, DataIntegrityViolationException cause) {
-    return new GarageReconciliationException(
-        "Não foi possível remover registros obsoletos do tipo "
-            + recordType
-            + " durante a sincronização porque existem referências no banco de dados.",
-        cause);
+  @Transactional
+  public GarageStateSummary synchronize(ValidatedGarageConfiguration configuration) {
+    return replaceAll(configuration);
+  }
+
+  @Transactional(readOnly = true)
+  public GarageStateSummary summarize() {
+    return summarizeInternal();
+  }
+
+  private GarageStateSummary summarizeInternal() {
+    var sectors = sectorRepository.findAll();
+    var sectorSummaries = new ArrayList<GarageStateSummary.SectorSummary>();
+    long occupied = 0;
+    for (GarageSector sector : sectors) {
+      long sectorOccupied = spotRepository.countBySectorIdAndOccupiedTrue(sector.getId());
+      occupied += sectorOccupied;
+      sectorSummaries.add(
+          new GarageStateSummary.SectorSummary(
+              sector.getCode(),
+              sector.getMaxCapacity(),
+              sectorOccupied,
+              sector.getBasePrice(),
+              sector.getOpenHour(),
+              sector.getCloseHour()));
+    }
+    return new GarageStateSummary(sectors.size(), spotRepository.count(), occupied, sectorSummaries);
   }
 }

@@ -382,6 +382,8 @@ Por compatibilidade com o contrato do desafio, `GET /revenue` recebe um body JSO
 
 A receita soma os valores persistidos no `EXIT` das sessões finalizadas do setor. A data representa o dia do `EXIT` em `America/Sao_Paulo`; o retorno usa `BRL` e inclui o instante UTC da consulta.
 
+Valores financeiros são mantidos internamente com quatro casas decimais. O faturamento soma os valores persistidos com sua precisão original e somente o total apresentado pela API é arredondado para duas casas com `HALF_UP`. Essa decisão atende às duas casas exigidas na resposta pelo enunciado, que não define o tratamento de frações de centavo.
+
 No fluxo operacional, `ENTRY` consome capacidade global sem ocupar uma vaga específica. `PARKED` define a vaga e o setor e congela o preço dinâmico. A cobrança considera todo o intervalo entre `ENTRY` e `EXIT`.
 
 ## Idempotência

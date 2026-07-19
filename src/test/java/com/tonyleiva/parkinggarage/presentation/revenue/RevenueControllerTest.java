@@ -52,7 +52,7 @@ class RevenueControllerTest {
         org.mockito.ArgumentMatchers.eq("A"),
         org.mockito.ArgumentMatchers.eq(ParkingSessionStatus.FINISHED),
         org.mockito.ArgumentMatchers.any(),
-        org.mockito.ArgumentMatchers.any())).thenReturn(new BigDecimal("89.1000"));
+        org.mockito.ArgumentMatchers.any())).thenReturn(new BigDecimal("50.6250"));
 
     mockMvc.perform(get("/revenue")
             .contentType(MediaType.APPLICATION_JSON)
@@ -63,7 +63,7 @@ class RevenueControllerTest {
         .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
         .andExpect(jsonPath("$.*", hasSize(3)))
         .andExpect(jsonPath("$.amount").isNumber())
-        .andExpect(jsonPath("$.amount").value(89.10))
+        .andExpect(jsonPath("$.amount").value(50.63))
         .andExpect(jsonPath("$.currency").value("BRL"))
         .andExpect(jsonPath("$.timestamp").value("2025-01-01T12:00:00.000Z"))
         .andExpect(jsonPath("$.duplicate").doesNotExist());

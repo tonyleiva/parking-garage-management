@@ -387,6 +387,35 @@ class GarageSynchronizationIntegrationTest {
   }
 
   @Test
+  void shouldRoundOnePersistedFractionalCentOnlyWhenPresentingRevenue() {
+    persistenceService.replaceAll(validator.validate(revenueSnapshot()));
+    Long sectorA = sectorRepository.findByCode("A").orElseThrow().getId();
+    insertSession("ZUL2001", sectorA, "FINISHED", "2025-01-01T12:00:00Z", "50.6250");
+
+    var persistedSum = sumRevenueForJanuaryFirst("A");
+    var result = revenueService.calculate("2025-01-01", "A");
+
+    assertThat(persistedSum).isEqualByComparingTo("50.6250");
+    assertThat(result.amount()).isEqualByComparingTo("50.63");
+    assertThat(result.amount().scale()).isEqualTo(2);
+  }
+
+  @Test
+  void shouldSumPersistedFractionalCentsBeforeRoundingRevenue() {
+    persistenceService.replaceAll(validator.validate(revenueSnapshot()));
+    Long sectorA = sectorRepository.findByCode("A").orElseThrow().getId();
+    insertSession("ZUL2001", sectorA, "FINISHED", "2025-01-01T12:00:00Z", "50.6250");
+    insertSession("ZUL2002", sectorA, "FINISHED", "2025-01-01T13:00:00Z", "50.6250");
+
+    var persistedSum = sumRevenueForJanuaryFirst("A");
+    var result = revenueService.calculate("2025-01-01", "A");
+
+    assertThat(persistedSum).isEqualByComparingTo("101.2500");
+    assertThat(result.amount()).isEqualByComparingTo("101.25");
+    assertThat(result.amount()).isNotEqualByComparingTo("101.26");
+  }
+
+  @Test
   void shouldLoadInitialSnapshotWhenResetIsFalseAndDatabaseIsEmpty() {
     GarageSimulatorClient client = mock(GarageSimulatorClient.class);
     when(client.fetchConfiguration()).thenReturn(GarageConfigurationFixtures.valid());
@@ -673,6 +702,14 @@ class GarageSynchronizationIntegrationTest {
         LocalDateTime.ofInstant(Instant.parse(exitTime), ZoneOffset.UTC),
         new BigDecimal(amount),
         status);
+  }
+
+  private BigDecimal sumRevenueForJanuaryFirst(String sectorCode) {
+    return sessionRepository.sumAmountBySectorAndStatusAndExitTime(
+        sectorCode,
+        ParkingSessionStatus.FINISHED,
+        Instant.parse("2025-01-01T03:00:00Z"),
+        Instant.parse("2025-01-02T03:00:00Z"));
   }
 
   private void createEntry(String plate, String entryTime, String key) {

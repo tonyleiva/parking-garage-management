@@ -223,6 +223,38 @@ Timestamps absolutos são representados por `Instant` e tratados em UTC.
 
 Horários comerciais são representados por `LocalTime` e armazenados sem conversão de fuso.
 
+### Consultas úteis para validação
+
+```sql
+SELECT *
+FROM garage_sector
+ORDER BY code;
+
+SELECT *
+FROM parking_spot
+ORDER BY external_id;
+
+SELECT *
+FROM parking_session
+ORDER BY id;
+
+SELECT *
+FROM processed_webhook_event
+ORDER BY id;
+
+SELECT *
+FROM flyway_schema_history
+ORDER BY installed_rank;
+```
+
+Com o snapshot atual do simulador, a carga inicial deve apresentar:
+
+- 2 setores;
+- 30 vagas;
+- horários comerciais iguais aos recebidos;
+- ocupação correspondente ao snapshot;
+- migrations V1, V2 e V3 registradas pelo Flyway.
+
 ## Logs
 
 Logs e mensagens operacionais são escritos em português.

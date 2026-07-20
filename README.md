@@ -63,8 +63,6 @@ Resultados atuais na branch `main`:
 
 Não é necessário instalar o Gradle, pois o projeto utiliza Gradle Wrapper.
 
-No Docker Desktop para macOS, o recurso de *host networking* deve estar habilitado para executar o simulador com `--network="host"`.
-
 ## Executando localmente
 
 ### 1. Subir o MySQL
@@ -84,6 +82,8 @@ Usuário: parking_user
 Senha: parking_password
 ```
 
+> No DBeaver, conexões locais com MySQL 8 podem exigir, para ambiente de desenvolvimento, as propriedades `allowPublicKeyRetrieval=true` e `useSSL=false`.
+
 ### 2. Iniciar o simulador
 
 Na primeira execução:
@@ -91,8 +91,14 @@ Na primeira execução:
 ```bash
 docker run -d \
   --name garage-sim \
-  --network="host" \
+  -p 3000:3000 \
   cfontes0estapar/garage-sim:1.0.0
+```
+
+No Windows, o mesmo comando pode ser executado em uma única linha:
+
+```powershell
+docker run -d --name garage-sim -p 3000:3000 cfontes0estapar/garage-sim:1.0.0
 ```
 
 Nas execuções seguintes:
@@ -135,6 +141,8 @@ LOGGING_LEVEL_COM_TONYLEIVA_PARKINGGARAGE=DEBUG ./gradlew bootRun
 |---|---|---|
 | `POST` | `/webhook` | Recebe eventos `ENTRY`, `PARKED` e `EXIT` |
 | `GET` | `/revenue` | Consulta a receita diária de um setor pelo dia do `EXIT` |
+
+Os endpoints acima estão disponíveis em `http://localhost:3003`.
 
 O endpoint `GET /garage` pertence ao simulador externo e fica disponível em `http://localhost:3000/garage`.
 
@@ -184,12 +192,16 @@ curl -i -X POST http://localhost:3003/webhook \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: entry-zul0001-20250101' \
   -d '{"license_plate":"ZUL0001","entry_time":"2025-01-01T12:00:00.000Z","event_type":"ENTRY"}'
+```
 
+```bash
 curl -i -X POST http://localhost:3003/webhook \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: parked-zul0001-20250101' \
   -d '{"license_plate":"ZUL0001","lat":-23.561684,"lng":-46.655981,"event_type":"PARKED"}'
+```
 
+```bash
 curl -i -X POST http://localhost:3003/webhook \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: exit-zul0001-20250101' \

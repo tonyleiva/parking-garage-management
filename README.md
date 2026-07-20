@@ -38,6 +38,12 @@ A solução prioriza consistência transacional, idempotência, concorrência, t
 - JaCoCo
 - SonarQube Cloud
 
+## Decisões técnicas
+
+As decisões detalhadas sobre startup, idempotência, concorrência, timezone, persistência financeira, ambiguidades do enunciado e evoluções futuras estão documentadas em:
+
+[Decisões técnicas](docs/technical-decisions.md)
+
 ## Qualidade
 
 Resultados atuais na branch `main`:
@@ -282,12 +288,6 @@ build/reports/jacoco/test/html/index.html
 | `GARAGE_SIMULATOR_CONNECT_TIMEOUT` | `2s` | Timeout de conexão |
 | `GARAGE_SIMULATOR_READ_TIMEOUT` | `5s` | Timeout de leitura |
 | `GARAGE_STARTUP_RESET_FROM_SIMULATOR` | `false` | Recarrega um novo snapshot validado |
-
-## Decisões técnicas
-
-As decisões detalhadas sobre startup, idempotência, concorrência, timezone, persistência financeira, ambiguidades do enunciado e evoluções futuras estão documentadas em:
-
-[Decisões técnicas](docs/technical-decisions.md)
 
 ## Encerrando o ambiente
 
